@@ -298,7 +298,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+// Bind to loopback only — prevents other machines on the same LAN from calling
+// node APIs or Bitcoin RPC through this proxy without authentication.
+server.listen(PORT, '127.0.0.1', () => {
   console.log('\n╔══════════════════════════════════════════════════════╗');
   console.log('║      RGB-LDK Integration Demo Proxy Server           ║');
   console.log('║      Author: Stash Labs                              ║');

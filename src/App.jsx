@@ -7,25 +7,66 @@ import { StatePanel } from './components/StatePanel';
 import { ResponsePanel, Button } from './components/UI';
 import { getSteps } from './steps';
 
+// ── Swap session-storage helpers ─────────────────────────────────────────────
+// Preimage survives same-tab page refreshes (sessionStorage) but is automatically
+// cleared when the browser tab is closed — scoped to this swap session.
+const SWAP_STORAGE_KEY = 'rgb_swap_preimage_v1';
+const HTLC_EXPIRY_MS   = 3600 * 1000;  // must match expiry_secs: 3600 in runSwapStep1
+const HTLC_SAFETY_MS   = 120_000;      // refuse step③/④ if < 2 min remain before expiry
+
+function saveSwapToSession(preimage, paymentHash) {
+  sessionStorage.setItem(SWAP_STORAGE_KEY, JSON.stringify({
+    preimage,
+    paymentHash,
+    createdAt: Date.now(),
+  }));
+}
+
+function loadSwapFromSession() {
+  try {
+    const raw = sessionStorage.getItem(SWAP_STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    const elapsed = Date.now() - data.createdAt;
+    if (elapsed >= HTLC_EXPIRY_MS) {
+      sessionStorage.removeItem(SWAP_STORAGE_KEY);
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function clearSwapSession() {
+  sessionStorage.removeItem(SWAP_STORAGE_KEY);
+}
+
+function getRemainingHtlcMs() {
+  const data = loadSwapFromSession();
+  if (!data) return 0;
+  return HTLC_EXPIRY_MS - (Date.now() - data.createdAt);
+}
+
 export default function App() {
   const [config, setConfig] = useState(defaultConfig);
   const [state, setState] = useState(defaultState);
   const [nodeStatus, setNodeStatus] = useState({ alice: null, bob: null, btc: null });
-  
+
   const [currentStep, setCurrentStep] = useState(0);
   const [stepDone, setStepDone] = useState(new Set());
   const [stepError, setStepError] = useState(new Set());
-  
+
   const [stepStates, setStepStates] = useState({});
   const [swapUnlocked, setSwapUnlocked] = useState({ 1: false, 2: false, 3: false, 4: false });
 
   const updateState = (updates) => setState(prev => ({ ...prev, ...updates }));
-  
+
   const markDone = (i) => {
     setStepDone(prev => { const next = new Set(prev); next.add(i); return next; });
     setStepError(prev => { const next = new Set(prev); next.delete(i); return next; });
   };
-  
+
   const markError = (i) => {
     setStepError(prev => { const next = new Set(prev); next.add(i); return next; });
     setStepDone(prev => { const next = new Set(prev); next.delete(i); return next; });
@@ -43,10 +84,10 @@ export default function App() {
       const [as, bs, bc] = await Promise.all([
         api('alice', '/api/v1/status').catch(() => null),
         api('bob',   '/api/v1/status').catch(() => null),
-        fetch('/bitcoin', { 
-          method:'POST', 
-          headers:{'Content-Type':'application/json'}, 
-          body: JSON.stringify({jsonrpc:'1.0',method:'getblockchaininfo',params:[],id:'1'}) 
+        fetch('/bitcoin', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({jsonrpc:'1.0',method:'getblockchaininfo',params:[],id:'1'})
         }).then(r=>r.json()).catch(() => null),
       ]);
       setNodeStatus({ alice: as, bob: bs, btc: bc });
@@ -61,7 +102,7 @@ export default function App() {
         api('alice', '/api/v1/node_id').catch(() => null),
         api('bob',   '/api/v1/node_id').catch(() => null),
       ]);
-      
+
       if (aId?.data?.node_id) { updates.aliceNodeId = aId.data.node_id; log.push('aliceNodeId'); }
       if (bId?.data?.node_id) { updates.bobNodeId = bId.data.node_id; log.push('bobNodeId'); }
 
@@ -86,10 +127,22 @@ export default function App() {
         }
       }
 
+      // Restore swap preimage from sessionStorage so a page refresh doesn't
+      // strand Alice's funds when she's already sent TTK but hasn't claimed BTC.
+      const savedSwap = loadSwapFromSession();
+      if (savedSwap && !updates.swapPreimage) {
+        updates.swapPreimage  = savedSwap.preimage;
+        updates.swapPaymentHash = savedSwap.paymentHash;
+        const remainingSec = Math.floor(getRemainingHtlcMs() / 1000);
+        log.push(`swapPreimage (${remainingSec}s left on HTLC)`);
+        // Re-unlock swap buttons so the user can continue from where they left off.
+        setSwapUnlocked({ 1: true, 2: true, 3: true, 4: true });
+      }
+
       if (Object.keys(updates).length > 0) {
         updateState(updates);
       }
-      
+
       if (manual) {
         alert(log.length ? `✅ Restored: ${log.join(', ')}` : '⚠️ Nothing to restore');
       }
@@ -102,10 +155,10 @@ export default function App() {
     fetch('/config').then(r => r.json()).then(cfg => {
       setConfig(prev => ({ ...prev, ...cfg }));
     }).catch(() => {});
-    
+
     refreshStatus();
     restoreState(false);
-    
+
     const interval = setInterval(refreshStatus, 10000);
     return () => clearInterval(interval);
   }, [refreshStatus, restoreState]);
@@ -454,7 +507,7 @@ export default function App() {
       const payResp = await api('alice', '/api/v1/rgb/ln/pay', 'POST', { invoice });
       const evResp = await serverAction('/wait-event', { node: 'alice', eventType: 'PaymentSuccessful', maxPolls: 10 });
       const chansAlice = await api('alice', '/api/v1/channels');
-      
+
       setStepState('rgb-ln-pay', false, 200, {
         invoice: invoice.slice(0, 40) + '…',
         payment: payResp.data,
@@ -478,7 +531,7 @@ export default function App() {
       await bitcoin('generatetoaddress', [1, mineAddr]);
       await api('bob', '/api/v1/wallet/sync', 'POST', {});
       const balResp = await api('bob', '/api/v1/balances');
-      
+
       setStepState('hold-swap', false, 200, {
         step: '⓪ Fund Bob 0.05 BTC',
         bob_address: bobAddr,
@@ -497,23 +550,26 @@ export default function App() {
     try {
       const preimage = randHex(32);
       const paymentHash = await sha256hex(preimage);
-      updateState({ swapPreimage: preimage, swapPaymentHash: paymentHash });
 
       const r = await api('alice', '/api/v1/bolt11/receive_for_hash', 'POST', {
         payment_hash: paymentHash,
         amount_msat: '10000000',
         description: 'swap: 10000 sats for 200 TTK',
-        expiry_secs: 3600, // 1 hour — gives enough time to complete the swap steps
+        expiry_secs: HTLC_EXPIRY_MS / 1000,
       });
       if (r.status !== 200) throw new Error('Hold invoice creation failed: ' + JSON.stringify(r.data));
-      updateState({ holdInvoice: r.data.invoice });
+
+      // Persist preimage AFTER the node confirms the invoice — if the node call
+      // fails, we never save a preimage for a non-existent invoice.
+      saveSwapToSession(preimage, paymentHash);
+      updateState({ swapPreimage: preimage, swapPaymentHash: paymentHash, holdInvoice: r.data.invoice });
 
       setStepState('hold-swap', false, 200, {
         step: '① Alice creates hold invoice',
         preimage,
         payment_hash: paymentHash,
         invoice: r.data,
-        note: 'Invoice valid for 1 hour. Proceed to ② immediately.',
+        note: `Invoice valid for ${HTLC_EXPIRY_MS / 60000} min. Preimage saved to sessionStorage — survives page refresh.`,
       }, '✓ ① Done', 'success');
       setSwapUnlocked(prev => ({ ...prev, 2: true }));
     } catch (e) {
@@ -575,6 +631,19 @@ export default function App() {
     setStepState('hold-swap', true, null, null, 'Sending RGB…');
     try {
       if (!state.assetId) throw new Error('Issue contract first');
+
+      // Safety guard: refuse to send TTK if the HTLC is about to expire.
+      // If we send TTK now but can't claim BTC before expiry, Alice loses TTK for free.
+      const remainingMs = getRemainingHtlcMs();
+      if (remainingMs < HTLC_SAFETY_MS) {
+        const remainingSec = Math.floor(remainingMs / 1000);
+        throw new Error(
+          `HTLC expires in ${remainingSec}s (< ${HTLC_SAFETY_MS / 1000}s safety margin). ` +
+          `Sending TTK now risks Alice losing assets. ` +
+          `Let this HTLC timeout so Bob's BTC is refunded, then re-run ① to start fresh.`
+        );
+      }
+
       const invResp = await api('bob', '/api/v1/rgb/ln/invoice/create', 'POST', {
         asset_id: state.assetId,
         asset_amount: '200',
@@ -585,7 +654,7 @@ export default function App() {
       const payResp = await api('alice', '/api/v1/rgb/ln/pay', 'POST', { invoice: invResp.data.invoice });
       updateState({ rgbPaymentId: payResp.data.payment_id });
       const evResp = await serverAction('/wait-event', { node: 'alice', eventType: 'PaymentSuccessful', maxPolls: 8 });
-      
+
       setStepState('hold-swap', false, 200, {
         step: '③ Alice sends 200 TTK to Bob via RGB LN',
         rgb_invoice: invResp.data.invoice.slice(0, 40) + '…',
@@ -602,6 +671,20 @@ export default function App() {
   const runSwapStep4 = async () => {
     setStepState('hold-swap', true, null, null, 'Claiming BTC…');
     try {
+      // Guard: enforce that step③ RGB payment completed before claiming BTC.
+      // swapUnlocked[4] is only set to true inside runSwapStep3 after PaymentSuccessful
+      // event is confirmed — this prevents Alice from skipping TTK delivery.
+      if (!swapUnlocked[4]) {
+        throw new Error(
+          'Step③ (Alice sends RGB TTK) must complete successfully before claiming BTC. ' +
+          'Run ③ first to ensure Bob has received the tokens.'
+        );
+      }
+
+      if (!state.swapPreimage || !state.swapPaymentHash) {
+        throw new Error('Preimage not found. If you refreshed the page, the preimage may have expired. Re-run ① to start a new swap.');
+      }
+
       const r = await api('alice', '/api/v1/bolt11/claim_for_hash', 'POST', {
         payment_hash: state.swapPaymentHash,
         preimage: state.swapPreimage,
@@ -609,7 +692,11 @@ export default function App() {
       });
       const aliceBal = await api('alice', '/api/v1/balances');
       const bobBal = await api('bob', '/api/v1/balances');
-      
+
+      // Clear persisted preimage immediately after successful claim — do not leave
+      // the preimage in sessionStorage longer than necessary.
+      clearSwapSession();
+
       setStepState('hold-swap', false, r.status, {
         step: '④ Alice claims BTC by revealing preimage — SWAP COMPLETE',
         claim: r.data,
@@ -651,14 +738,14 @@ export default function App() {
       stepDone, stepError, updateState, restoreState
     }}>
       <Sidebar steps={steps} />
-      
+
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden bg-bg">
         <StatusBar />
-        
+
         <div className="flex-1 overflow-y-auto p-6">
           <div className="max-w-4xl mx-auto">
             {currentStepData.render()}
-            
+
             {currentStepData.id === 'hold-swap' ? (
               <div className="flex flex-wrap gap-2 mt-4 items-center">
                 <Button variant="secondary" onClick={runSwapFundBob} loading={currentStepState.loading && currentStepState.btnText === 'Funding…'}>
@@ -679,7 +766,7 @@ export default function App() {
               </div>
             ) : (
               <div className="mt-4">
-                <Button 
+                <Button
                   onClick={getRunHandler(currentStepData.id)}
                   loading={currentStepState.loading}
                   variant={currentStepState.btnVariant}
@@ -688,15 +775,15 @@ export default function App() {
                 </Button>
               </div>
             )}
-            
-            <ResponsePanel 
+
+            <ResponsePanel
               visible={!!currentStepState.data || currentStepState.status === 500}
               status={currentStepState.status}
               data={currentStepState.data}
             />
           </div>
         </div>
-        
+
         <StatePanel />
       </div>
     </AppContext.Provider>
