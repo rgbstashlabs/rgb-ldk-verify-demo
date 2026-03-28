@@ -1,0 +1,222 @@
+# RGB-LDK Demo — Local Regtest Docker Compose
+#
+# Services:
+#   bitcoind      172.18.0.2  port 18443 (RPC)
+#   esplora       172.18.0.3  port 3003  (HTTP, host-only)
+#   rgb-node-alice 172.18.0.4 port 8500  (HTTP API), 9735 (P2P)
+#   rgb-node-bob   172.18.0.5 port 8501  (HTTP API), 9736 (P2P)
+#
+# Start: docker compose up -d
+# Reset: docker compose down -v && docker compose up -d
+
+services:
+  bitcoind:
+    image: ruimarinho/bitcoin-core:24.0.1
+    container_name: bitcoind
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18443:18443"
+    volumes:
+      - bitcoin_data:/home/bitcoin/.bitcoin
+    command:
+      - -printtoconsole
+      - -regtest=1
+      - -server=1
+      - -rest=1
+      - -rpcuser=btcuser
+      - -rpcpassword=btcpass
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -txindex=1
+      - -fallbackfee=0.0001
+    healthcheck:
+      test: >
+        bitcoin-cli -regtest -rpcuser=btcuser -rpcpassword=btcpass getblockchaininfo || exit 1
+      interval: 5s
+      retries: 20
+    networks:
+      demo_net:
+        ipv4_address: 172.18.0.2
+
+  bitcoind-init:
+    image: ruimarinho/bitcoin-core:24.0.1
+    container_name: bitcoind-init
+    restart: "no"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    volumes:
+      - bitcoin_data:/home/bitcoin/.bitcoin
+    networks:
+      - demo_net
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        bcli() {
+          bitcoin-cli -regtest -rpcconnect=bitcoind -rpcuser=btcuser -rpcpassword=btcpass "$$@";
+        }
+
+        echo "Creating wallet 'demo'..."
+        bcli createwallet demo >/dev/null 2>&1 || true
+        bcli loadwallet demo >/dev/null 2>&1 || true
+
+        BLOCK_COUNT=$$(bcli getblockcount)
+        if [ -z "$$BLOCK_COUNT" ]; then
+          BLOCK_COUNT=0
+        fi
+        if [ "$$BLOCK_COUNT" -lt 101 ]; then
+          ADDR=$$(bcli -rpcwallet=demo getnewaddress)
+          echo "Mining 101 blocks to $$ADDR..."
+          bcli generatetoaddress 101 "$$ADDR" >/dev/null
+        fi
+
+        echo "Init complete: height=$$(bcli getblockcount)"
+
+  esplora:
+    image: bitlightlabs/esplora-api-rln:v0.3.0
+    container_name: esplora
+    restart: unless-stopped
+    depends_on:
+      bitcoind-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:3003:3000"
+    volumes:
+      - bitcoin_data:/data/.bitcoin
+    command:
+      - -vvvv
+      - --network
+      - regtest
+      - --daemon-dir
+      - /data/.bitcoin
+      - --daemon-rpc-addr
+      - bitcoind:18443
+      - --cors
+      - "*"
+      - --cookie
+      - "btcuser:btcpass"
+      - --http-addr
+      - "0.0.0.0:3000"
+      - --electrum-rpc-addr
+      - 0.0.0.0:50001
+    networks:
+      demo_net:
+        ipv4_address: 172.18.0.3
+
+  wait-esplora:
+    image: alpine:latest
+    container_name: wait-esplora
+    restart: "no"
+    depends_on:
+      esplora:
+        condition: service_started
+    networks:
+      - demo_net
+    command:
+      - sh
+      - -ec
+      - |
+        for _ in $(seq 1 240); do
+          if wget -qO- "http://esplora:3000/fee-estimates" >/dev/null 2>&1; then
+            echo "esplora ready"
+            exit 0
+          fi
+          sleep 0.5
+        done
+        echo "esplora not ready after timeout" >&2
+        exit 1
+
+  rgb-node-alice:
+    image: bitlightlabs/rln-ldk-node:latest
+    container_name: rgb-node-alice
+    restart: unless-stopped
+    depends_on:
+      wait-esplora:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8500:8500"
+      - "127.0.0.1:9735:9735"
+    volumes:
+      - alice_data:/home/rgbldk/.ldk-node
+      - ./node-passphrase.txt:/run/secrets/passphrase:ro
+    command:
+      - rgbldkd
+      - server
+      - --listen
+      - 0.0.0.0:8500
+      - --allow-non-loopback-listen
+      - --data-dir
+      - /home/rgbldk/.ldk-node
+      - --keystore-passphrase-file
+      - /run/secrets/passphrase
+      - --auto-init-keystore
+      - --auto-unlock
+      - --network
+      - regtest
+      - --esplora-url
+      - http://esplora:3000
+      - --ldk-listen
+      - 0.0.0.0:9735
+      - --node-alias
+      - alice
+      - --rgb-enabled
+      - --log-to-stdout
+      - --log-level
+      - info
+    networks:
+      demo_net:
+        ipv4_address: 172.18.0.4
+
+  rgb-node-bob:
+    image: bitlightlabs/rln-ldk-node:latest
+    container_name: rgb-node-bob
+    restart: unless-stopped
+    depends_on:
+      wait-esplora:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8501:8500"
+      - "127.0.0.1:9736:9735"
+    volumes:
+      - bob_data:/home/rgbldk/.ldk-node
+      - ./node-passphrase.txt:/run/secrets/passphrase:ro
+    command:
+      - rgbldkd
+      - server
+      - --listen
+      - 0.0.0.0:8500
+      - --allow-non-loopback-listen
+      - --data-dir
+      - /home/rgbldk/.ldk-node
+      - --keystore-passphrase-file
+      - /run/secrets/passphrase
+      - --auto-init-keystore
+      - --auto-unlock
+      - --network
+      - regtest
+      - --esplora-url
+      - http://esplora:3000
+      - --ldk-listen
+      - 0.0.0.0:9735
+      - --node-alias
+      - bob
+      - --rgb-enabled
+      - --log-to-stdout
+      - --log-level
+      - info
+    networks:
+      demo_net:
+        ipv4_address: 172.18.0.5
+
+networks:
+  demo_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/24
+
+volumes:
+  bitcoin_data:
+  alice_data:
+  bob_data:
