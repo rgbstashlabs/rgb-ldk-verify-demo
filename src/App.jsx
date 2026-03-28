@@ -729,21 +729,26 @@ export default function App() {
       const aliceBal = await api('alice', '/api/v1/balances');
       const bobBal = await api('bob', '/api/v1/balances');
 
-      // Clear persisted preimage only after a confirmed successful claim.
-      // If the node returns an error (expired invoice, network failure, etc.),
-      // keep the preimage in sessionStorage so the user can retry step④.
       if (r.status === 200) {
+        // Clear persisted preimage only after a confirmed successful claim.
         clearSwapSession();
+        setStepState('hold-swap', false, 200, {
+          step: '④ Alice claims BTC by revealing preimage — SWAP COMPLETE',
+          claim: r.data,
+          alice_balance: aliceBal.data,
+          bob_balance: bobBal.data,
+          summary: { alice: '+10000 sats, -200 TTK', bob: '-10000 sats, +200 TTK' },
+        }, '✓ ④ SWAP COMPLETE!', 'success');
+        markDone(12);
+      } else {
+        // Claim failed — preimage is preserved in sessionStorage for retry.
+        setStepState('hold-swap', false, r.status, {
+          step: '④ Claim BTC failed',
+          claim: r.data,
+          note: 'Preimage preserved in sessionStorage — retry step④ if HTLC has not expired.',
+        }, '✗ Claim Failed — Retry ④', 'danger');
+        markError(12);
       }
-
-      setStepState('hold-swap', false, r.status, {
-        step: '④ Alice claims BTC by revealing preimage — SWAP COMPLETE',
-        claim: r.data,
-        alice_balance: aliceBal.data,
-        bob_balance: bobBal.data,
-        summary: { alice: '+10000 sats, -200 TTK', bob: '-10000 sats, +200 TTK' },
-      }, '✓ ④ SWAP COMPLETE!', 'success');
-      markDone(12);
     } catch (e) {
       setStepState('hold-swap', false, 500, { error: e.message }, '✗ Error', 'danger');
     }
