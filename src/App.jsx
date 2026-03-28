@@ -14,12 +14,25 @@ const SWAP_STORAGE_KEY = 'rgb_swap_preimage_v1';
 const HTLC_EXPIRY_MS   = 3600 * 1000;  // must match expiry_secs: 3600 in runSwapStep1
 const HTLC_SAFETY_MS   = 120_000;      // refuse step③/④ if < 2 min remain before expiry
 
-function saveSwapToSession(preimage, paymentHash) {
+function saveSwapToSession(preimage, paymentHash, holdInvoice = null) {
   sessionStorage.setItem(SWAP_STORAGE_KEY, JSON.stringify({
     preimage,
     paymentHash,
+    holdInvoice,
+    step3Completed: false,  // only becomes true after PaymentSuccessful is confirmed
     createdAt: Date.now(),
   }));
+}
+
+// Called after step③ PaymentSuccessful is confirmed — persists completion state
+// so that after a page refresh, swapUnlocked[4] is correctly restored to true.
+function markSwapStep3Complete() {
+  try {
+    const raw = sessionStorage.getItem(SWAP_STORAGE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    sessionStorage.setItem(SWAP_STORAGE_KEY, JSON.stringify({ ...data, step3Completed: true }));
+  } catch { /* ignore storage errors */ }
 }
 
 function loadSwapFromSession() {
@@ -131,12 +144,20 @@ export default function App() {
       // strand Alice's funds when she's already sent TTK but hasn't claimed BTC.
       const savedSwap = loadSwapFromSession();
       if (savedSwap && !updates.swapPreimage) {
-        updates.swapPreimage  = savedSwap.preimage;
+        updates.swapPreimage    = savedSwap.preimage;
         updates.swapPaymentHash = savedSwap.paymentHash;
+        // Restore holdInvoice so step② can still execute after a page refresh.
+        if (savedSwap.holdInvoice) updates.holdInvoice = savedSwap.holdInvoice;
         const remainingSec = Math.floor(getRemainingHtlcMs() / 1000);
         log.push(`swapPreimage (${remainingSec}s left on HTLC)`);
-        // Re-unlock swap buttons so the user can continue from where they left off.
-        setSwapUnlocked({ 1: true, 2: true, 3: true, 4: true });
+        // Only re-unlock step④ if step③ was confirmed complete before the refresh.
+        // Unconditionally unlocking ④ would bypass the Exit Scam guard in runSwapStep4.
+        setSwapUnlocked({
+          1: true,
+          2: true,
+          3: true,
+          4: savedSwap.step3Completed === true,
+        });
       }
 
       if (Object.keys(updates).length > 0) {
@@ -561,7 +582,8 @@ export default function App() {
 
       // Persist preimage AFTER the node confirms the invoice — if the node call
       // fails, we never save a preimage for a non-existent invoice.
-      saveSwapToSession(preimage, paymentHash);
+      // holdInvoice is also saved so step② can continue after a page refresh.
+      saveSwapToSession(preimage, paymentHash, r.data.invoice);
       updateState({ swapPreimage: preimage, swapPaymentHash: paymentHash, holdInvoice: r.data.invoice });
 
       setStepState('hold-swap', false, 200, {
@@ -655,6 +677,20 @@ export default function App() {
       updateState({ rgbPaymentId: payResp.data.payment_id });
       const evResp = await serverAction('/wait-event', { node: 'alice', eventType: 'PaymentSuccessful', maxPolls: 8 });
 
+      // Critical check: if the PaymentSuccessful event wasn't received (found=null),
+      // the RGB payment may not have completed. Proceeding to step④ (claim BTC) in this
+      // state would mean Alice claims BTC while Bob may not have received the TTK.
+      if (!evResp.data?.found) {
+        throw new Error(
+          'RGB payment confirmation timed out — PaymentSuccessful event not received. ' +
+          'Check Alice\'s channel balance to verify whether Bob received the TTK before retrying. ' +
+          'Do NOT claim BTC until the RGB transfer is confirmed.'
+        );
+      }
+
+      // Persist step③ completion so the Exit Scam guard in step④ survives a page refresh.
+      markSwapStep3Complete();
+
       setStepState('hold-swap', false, 200, {
         step: '③ Alice sends 200 TTK to Bob via RGB LN',
         rgb_invoice: invResp.data.invoice.slice(0, 40) + '…',
@@ -693,9 +729,12 @@ export default function App() {
       const aliceBal = await api('alice', '/api/v1/balances');
       const bobBal = await api('bob', '/api/v1/balances');
 
-      // Clear persisted preimage immediately after successful claim — do not leave
-      // the preimage in sessionStorage longer than necessary.
-      clearSwapSession();
+      // Clear persisted preimage only after a confirmed successful claim.
+      // If the node returns an error (expired invoice, network failure, etc.),
+      // keep the preimage in sessionStorage so the user can retry step④.
+      if (r.status === 200) {
+        clearSwapSession();
+      }
 
       setStepState('hold-swap', false, r.status, {
         step: '④ Alice claims BTC by revealing preimage — SWAP COMPLETE',
